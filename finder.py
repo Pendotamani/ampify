@@ -1,17 +1,19 @@
 import time
 import requests
-from typing import List, Dict, Any, Optional
+import re
+from typing import List, Dict, Any
 
-# Public Overpass mirrors
-OVERPASS_URLS = [
+# Fast public Overpass endpoints
+OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
     "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
 ]
 
-# Hyderabad & major cities bounding boxes (south, west, north, east)
+# Accurate bounding boxes for Hyderabad & top metropolitan hubs
 CITY_BBOX_MAP = {
     "hyderabad": (17.15, 78.20, 17.65, 78.70),
+    "secunderabad": (17.40, 78.45, 17.55, 78.55),
     "bangalore": (12.80, 77.40, 13.15, 77.80),
     "bengaluru": (12.80, 77.40, 13.15, 77.80),
     "mumbai": (18.85, 72.75, 19.30, 73.05),
@@ -22,164 +24,159 @@ CITY_BBOX_MAP = {
 
 
 def get_city_bbox(city: str) -> tuple:
-    """Returns (south, west, north, east) bounding box for city."""
     clean_city = city.lower().strip()
     if clean_city in CITY_BBOX_MAP:
         return CITY_BBOX_MAP[clean_city]
         
     try:
         url = "https://nominatim.openstreetmap.org/search"
-        headers = {"User-Agent": "LeadFinderAgentApp/2.0 (contact@leadfinder.local)"}
+        headers = {"User-Agent": "PublicLeadFinder/3.0"}
         resp = requests.get(url, params={"q": city, "format": "json", "limit": 1}, headers=headers, timeout=5)
         if resp.status_code == 200:
             data = resp.json()
-            if data:
-                bbox = data[0].get("boundingbox", [])
-                if len(bbox) == 4:
-                    return (float(bbox[0]), float(bbox[2]), float(bbox[1]), float(bbox[3]))
+            if data and "boundingbox" in data[0]:
+                bbox = data[0]["boundingbox"]
+                return (float(bbox[0]), float(bbox[2]), float(bbox[1]), float(bbox[3]))
     except Exception:
         pass
         
     return (17.15, 78.20, 17.65, 78.70)
 
 
-def build_overpass_query(bbox: tuple, keyword: str, timeout: int = 25) -> str:
-    """
-    Overpass query using bounding box and targeted OSM tags:
-    amenity=taxi, office=logistics, office=transport, office=travel_agent, shop=travel_agency,
-    plus a case-insensitive regex on the keyword.
-    """
+def build_overpass_query(bbox: tuple, keyword: str, timeout: int = 15) -> str:
     s, w, n, e = bbox
     bbox_str = f"{s},{w},{n},{e}"
-    clean_kw = keyword.replace('"', '').strip()
+    clean_kw = re.sub(r'[^a-zA-Z0-9\s]', '', keyword).strip()
+    # Extract first word if multi-word like "fleet owner" -> "fleet"
+    primary_kw = clean_kw.split()[0] if clean_kw else "transport"
     
     return f"""
     [out:json][timeout:{timeout}];
     (
       node["amenity"="taxi"]({bbox_str});
-      way["amenity"="taxi"]({bbox_str});
-      relation["amenity"="taxi"]({bbox_str});
-
       node["office"="logistics"]({bbox_str});
-      way["office"="logistics"]({bbox_str});
-      relation["office"="logistics"]({bbox_str});
-
       node["office"="transport"]({bbox_str});
-      way["office"="transport"]({bbox_str});
-      relation["office"="transport"]({bbox_str});
-
       node["office"="travel_agent"]({bbox_str});
-      way["office"="travel_agent"]({bbox_str});
-      relation["office"="travel_agent"]({bbox_str});
-
+      node["office"="company"]({bbox_str});
       node["shop"="travel_agency"]({bbox_str});
-      way["shop"="travel_agency"]({bbox_str});
-      relation["shop"="travel_agency"]({bbox_str});
-
-      node["name"~"{clean_kw}",i]({bbox_str});
-      way["name"~"{clean_kw}",i]({bbox_str});
-      relation["name"~"{clean_kw}",i]({bbox_str});
+      node["name"~"{primary_kw}",i]({bbox_str});
+      way["office"~"logistics|transport|company"]({bbox_str});
+      way["name"~"{primary_kw}",i]({bbox_str});
     );
-    out center tags;
+    out center tags 40;
     """
 
 
-def query_nominatim_fallback(city: str, business_type: str) -> List[Dict[str, Any]]:
+def query_nominatim_osm(city: str, business_type: str) -> List[Dict[str, Any]]:
     """
-    Direct OpenStreetMap Nominatim search fallback when Overpass public mirrors are rate-limited.
+    Direct OpenStreetMap Nominatim POI query.
+    Guaranteed public directory response for city + keyword.
     """
     results = []
-    try:
-        url = "https://nominatim.openstreetmap.org/search"
-        headers = {"User-Agent": "LeadFinderAgentApp/2.0 (leadfinder@businessleads.local)"}
-        params = {
-            "q": f"{business_type} in {city}",
-            "format": "json",
-            "addressdetails": 1,
-            "extratags": 1,
-            "limit": 25
-        }
-        resp = requests.get(url, params=params, headers=headers, timeout=8)
-        if resp.status_code == 200:
-            for item in resp.json():
-                name = item.get("name") or item.get("display_name", "").split(",")[0]
-                if not name:
-                    continue
-                extratags = item.get("extratags", {}) or {}
-                results.append({
-                    "name": name.strip(),
-                    "address": item.get("display_name", city),
-                    "phone": extratags.get("phone") or extratags.get("contact:phone", ""),
-                    "website": extratags.get("website") or extratags.get("contact:website", ""),
-                    "city": city,
-                    "type": item.get("type") or business_type,
-                    "source": "OpenStreetMap (Nominatim)"
-                })
-    except Exception as e:
-        print(f"Nominatim fallback error: {e}")
+    clean_type = re.sub(r'[^a-zA-Z0-9\s]', '', business_type).strip()
+    queries = [
+        f"{clean_type} in {city}",
+        f"{clean_type} company {city}",
+        f"logistics {city}" if "transport" in clean_type or "fleet" in clean_type else f"{clean_type} {city}"
+    ]
+    
+    headers = {"User-Agent": "PublicLeadFinder/3.0 (leadfinder@businessleads.local)"}
+    
+    for q in queries:
+        try:
+            url = "https://nominatim.openstreetmap.org/search"
+            params = {
+                "q": q,
+                "format": "json",
+                "addressdetails": 1,
+                "extratags": 1,
+                "limit": 20
+            }
+            resp = requests.get(url, params=params, headers=headers, timeout=6)
+            if resp.status_code == 200:
+                for item in resp.json():
+                    name = item.get("name") or item.get("display_name", "").split(",")[0]
+                    if not name or len(name) < 3:
+                        continue
+                        
+                    # Filter out purely generic road/highway names unless it's an office
+                    osm_type = item.get("type", "")
+                    if osm_type in ["highway", "road", "residential", "tertiary"] and "Transport" not in name:
+                        continue
+                        
+                    extratags = item.get("extratags", {}) or {}
+                    website = extratags.get("website") or extratags.get("contact:website", "")
+                    phone = extratags.get("phone") or extratags.get("contact:phone", "")
+                    
+                    results.append({
+                        "name": name.strip(),
+                        "address": item.get("display_name", city),
+                        "phone": phone.strip(),
+                        "website": website.strip(),
+                        "city": city,
+                        "type": osm_type or business_type,
+                        "source": "OpenStreetMap Nominatim"
+                    })
+            if len(results) >= 15:
+                break
+        except Exception:
+            continue
+            
     return results
 
 
 def query_overpass(city: str, business_type: str) -> List[Dict[str, Any]]:
     """
-    Queries Overpass API using bounding box and targeted tags + keyword regex.
-    Falls back gracefully to Nominatim POI if public Overpass servers are congested.
+    Queries Overpass with timeout protection and merges with Nominatim OSM public records.
     """
     bbox = get_city_bbox(city)
     query = build_overpass_query(bbox, business_type)
+    headers = {"User-Agent": "PublicLeadFinder/3.0"}
     
-    headers = {
-        "User-Agent": "LeadFinderAgentApp/2.0 (contact@leadfinder.local)"
-    }
-    
-    for endpoint in OVERPASS_URLS:
+    overpass_results = []
+    for endpoint in OVERPASS_ENDPOINTS:
         try:
-            resp = requests.post(endpoint, data={"data": query}, headers=headers, timeout=15)
+            resp = requests.post(endpoint, data={"data": query}, headers=headers, timeout=10)
             if resp.status_code == 200:
-                data = resp.json()
-                elements = data.get("elements", [])
-                
-                results = []
-                seen_names = set()
-                
+                elements = resp.json().get("elements", [])
+                seen = set()
                 for el in elements:
                     tags = el.get("tags", {})
                     name = tags.get("name")
-                    if not name:
+                    if not name or name.strip().lower() in seen:
                         continue
-                        
-                    norm = name.strip().lower()
-                    if norm in seen_names:
-                        continue
-                    seen_names.add(norm)
+                    seen.add(name.strip().lower())
                     
-                    addr_parts = [
-                        tags.get("addr:housenumber"),
-                        tags.get("addr:street"),
-                        tags.get("addr:suburb") or tags.get("addr:district"),
-                        tags.get("addr:city") or city,
-                        tags.get("addr:postcode")
-                    ]
-                    address = ", ".join([p for p in addr_parts if p]) or tags.get("address", city)
-                    phone = tags.get("phone") or tags.get("contact:phone") or tags.get("telephone", "")
-                    website = tags.get("website") or tags.get("contact:website") or tags.get("url", "")
-                    
+                    addr = tags.get("addr:street") or tags.get("addr:city") or city
+                    phone = tags.get("phone") or tags.get("contact:phone", "")
+                    website = tags.get("website") or tags.get("contact:website", "")
                     if website and not website.startswith("http"):
                         website = "http://" + website
                         
-                    results.append({
+                    overpass_results.append({
                         "name": name.strip(),
-                        "address": address,
+                        "address": f"{addr}, {city}",
                         "phone": phone.strip(),
                         "website": website.strip(),
                         "city": city,
-                        "type": tags.get("office") or tags.get("amenity") or tags.get("shop") or business_type,
-                        "source": "OpenStreetMap (Overpass BBox)"
+                        "type": tags.get("office") or tags.get("amenity") or business_type,
+                        "source": "OpenStreetMap Overpass"
                     })
-                if results:
-                    return results
+                if overpass_results:
+                    break
         except Exception:
             continue
             
-    # If Overpass mirrors timed out or gave 406/429, fall back to Nominatim OSM search
-    return query_nominatim_fallback(city, business_type)
+    # Always supplement with Nominatim POI public directory
+    nominatim_results = query_nominatim_osm(city, business_type)
+    
+    # Merge and deduplicate
+    combined = []
+    seen_names = set()
+    for item in overpass_results + nominatim_results:
+        norm = item["name"].strip().lower()
+        if norm not in seen_names:
+            seen_names.add(norm)
+            combined.append(item)
+            
+    return combined
