@@ -12,36 +12,44 @@ HEADERS = {
 }
 
 EMAIL_REGEX = re.compile(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+')
-PHONE_REGEX = re.compile(r'(?:\+?\d{1,3}[-.\s]?)?\(?\d{2,5}\)?[-.\s]?\d{3,5}[-.\s]?\d{3,5}')
+
+# International phone formats (handles +91, (040), standard mobile/landlines)
+PHONE_REGEXES = [
+    re.compile(r'(?:\+?(\d{1,3}))?[-.\s]?(?:\(?(\d{2,5})\)?)?[-.\s]?(\d{3,5})[-.\s]?(\d{3,5})'),
+    re.compile(r'\b(?:\+91[-\s]?)?[6-9]\d{9}\b'), # Indian 10-digit mobile
+    re.compile(r'\b0\d{2,4}[-\s]?\d{6,8}\b'),     # Indian landlines (e.g. 040-XXXXXXXX)
+    re.compile(r'\b(?:\+1[-\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b'), # US/Canada
+    re.compile(r'\b(?:\+44[-\s]?)?\d{4,5}[-\s]?\d{6}\b') # UK
+]
 
 _ROBOTS_CACHE: Dict[str, Optional[RobotFileParser]] = {}
 _MX_CACHE: Dict[str, bool] = {}
 
 
 def check_mx_record(domain: str) -> bool:
-    """Free MX record lookup using dnspython (no SMTP)."""
-    clean_domain = domain.strip().lower()
-    if clean_domain in _MX_CACHE:
-        return _MX_CACHE[clean_domain]
+    """Free MX record lookup via dnspython."""
+    clean = domain.strip().lower()
+    if clean in _MX_CACHE:
+        return _MX_CACHE[clean]
         
     try:
-        answers = dns.resolver.resolve(clean_domain, 'MX', lifetime=4)
+        answers = dns.resolver.resolve(clean, 'MX', lifetime=4)
         has_mx = len(answers) > 0
-        _MX_CACHE[clean_domain] = has_mx
+        _MX_CACHE[clean] = has_mx
         return has_mx
     except Exception:
         try:
-            a_answers = dns.resolver.resolve(clean_domain, 'A', lifetime=3)
-            has_a = len(a_answers) > 0
-            _MX_CACHE[clean_domain] = has_a
+            a_ans = dns.resolver.resolve(clean, 'A', lifetime=3)
+            has_a = len(a_ans) > 0
+            _MX_CACHE[clean] = has_a
             return has_a
         except Exception:
-            _MX_CACHE[clean_domain] = False
+            _MX_CACHE[clean] = False
             return False
 
 
 def can_fetch_url(url: str) -> bool:
-    """Checks robots.txt for URL permissions."""
+    """Respects robots.txt before making requests."""
     try:
         parsed = urllib.parse.urlparse(url)
         base = f"{parsed.scheme}://{parsed.netloc}"
@@ -68,20 +76,43 @@ def can_fetch_url(url: str) -> bool:
         return True
 
 
-def extract_social_links(soup: BeautifulSoup) -> List[str]:
-    """Finds links to LinkedIn, Twitter/X, Facebook, Instagram."""
-    social_links = set()
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        low = href.lower()
-        if any(network in low for network in ["linkedin.com", "twitter.com", "x.com", "facebook.com", "instagram.com"]):
-            social_links.add(href)
-    return list(social_links)[:4]
+def clean_emails(raw_list: List[str]) -> List[str]:
+    """Cleans emails: removes images/assets, lowercases, removes duplicates."""
+    clean = []
+    seen = set()
+    ignored_ext = ('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.js', '.css', '.ico')
+    for e in raw_list:
+        low = e.strip().lower()
+        if not low or "@" not in low:
+            continue
+        if any(low.endswith(ext) for ext in ignored_ext):
+            continue
+        if len(low) < 5 or len(low) > 60:
+            continue
+        if low not in seen:
+            seen.add(low)
+            clean.append(low)
+    return clean
+
+
+def clean_phones(raw_list: List[str]) -> List[str]:
+    """Cleans phone numbers: formats, removes short numbers/noise."""
+    clean = []
+    seen_digits = set()
+    for p in raw_list:
+        p_str = p.strip()
+        digits = re.sub(r'\D', '', p_str)
+        # Skip invalid or common year numbers (e.g. 2024, 2026)
+        if 8 <= len(digits) <= 15:
+            if digits not in seen_digits:
+                seen_digits.add(digits)
+                clean.append(p_str)
+    return clean
 
 
 def scrape_page(url: str, timeout: int = 8) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Scrapes a single page for emails, phones, social links, and subpage candidates."""
-    data = {"emails": [], "phones": [], "socials": [], "subpages": []}
+    """Extracts emails and phones (regex + mailto: + tel:)."""
+    data = {"emails": [], "phones": [], "subpages": []}
     debug = {"url": url, "status": None, "error": None, "response_sample": ""}
     
     if not can_fetch_url(url):
@@ -101,47 +132,44 @@ def scrape_page(url: str, timeout: int = 8) -> Tuple[Dict[str, Any], Dict[str, A
         for tag in soup(["script", "style", "noscript"]):
             tag.decompose()
             
-        text = soup.get_text(separator=" ")
+        page_text = soup.get_text(separator=" ")
         
-        # Emails
-        raw_emails = set(EMAIL_REGEX.findall(text))
-        for m in raw_emails:
-            low = m.lower()
-            if not any(low.endswith(ext) for ext in ('.png', '.jpg', '.jpeg', '.svg', '.webp', '.js', '.css')) and len(low) < 60:
-                data["emails"].append(m)
-                
-        # Phones
-        for p in PHONE_REGEX.findall(text):
-            digits = re.sub(r'\D', '', p)
-            if 8 <= len(digits) <= 15:
-                data["phones"].append(p.strip())
-                
-        # Mailto / tel links
+        # Regex extraction
+        found_emails = EMAIL_REGEX.findall(page_text)
+        found_phones = []
+        for rx in PHONE_REGEXES:
+            matches = rx.findall(page_text)
+            for m in matches:
+                if isinstance(m, tuple):
+                    # Filter out empty tuple items from capture groups
+                    joined = "".join(m)
+                    if joined:
+                        found_phones.append(joined)
+                elif isinstance(m, str) and m:
+                    found_phones.append(m)
+            
+        # Mailto: and tel: links
         for a in soup.find_all("a", href=True):
             href = a["href"].strip()
             if href.startswith("mailto:"):
                 mail = href.replace("mailto:", "").split("?")[0].strip()
-                if mail and mail not in data["emails"]:
-                    data["emails"].append(mail)
+                if mail:
+                    found_emails.append(mail)
             elif href.startswith("tel:"):
-                tel = href.replace("tel:", "").strip()
-                if tel and tel not in data["phones"]:
-                    data["phones"].append(tel)
+                phone = href.replace("tel:", "").strip()
+                if phone:
+                    found_phones.append(phone)
                     
-        # Social links
-        data["socials"] = extract_social_links(soup)
-        
-        # Discover subpages
-        netloc = urllib.parse.urlparse(url).netloc
-        for a in soup.find_all("a", href=True):
-            href = a["href"].strip()
-            low = href.lower()
-            anchor_text = a.get_text().lower()
-            if any(term in low or term in anchor_text for term in ["contact", "about", "team", "people", "reach"]):
-                full = urllib.parse.urljoin(url, href)
-                if urllib.parse.urlparse(full).netloc == netloc and full != url:
-                    data["subpages"].append(full)
+            # Subpages candidate check
+            href_low = href.lower()
+            anchor_low = a.get_text().lower()
+            if any(term in href_low or term in anchor_low for term in ["contact", "about"]):
+                full_link = urllib.parse.urljoin(url, href)
+                if urllib.parse.urlparse(full_link).netloc == urllib.parse.urlparse(url).netloc and full_link != url:
+                    data["subpages"].append(full_link)
                     
+        data["emails"] = clean_emails(found_emails)
+        data["phones"] = clean_phones(found_phones)
     except Exception as e:
         debug["error"] = str(e)
         
@@ -150,126 +178,123 @@ def scrape_page(url: str, timeout: int = 8) -> Tuple[Dict[str, Any], Dict[str, A
 
 def crawl_company_website(website_url: str, delay: float = 0.5) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """
-    Website crawler:
-    Checks homepage, /contact, /about, and /team.
-    Extracts emails, phones, social links. Respects robots.txt and delays.
+    2. Contact extraction:
+    Crawls: homepage, /contact, /contact-us, /about, /about-us.
+    Extracts emails (regex + mailto:), phones (country regex + tel:).
+    Cleans data, lowercases, removes image extensions and duplicates.
     """
     if not website_url:
-        return {"emails": [], "phones": [], "socials": [], "pages_visited": []}, []
+        return {"emails": [], "phones": [], "pages_visited": []}, []
         
     debug_logs = []
     all_emails: Set[str] = set()
     all_phones: Set[str] = set()
-    all_socials: Set[str] = set()
     visited_pages: Set[str] = set()
     
-    # 1. Homepage
-    hp_data, hp_dbg = scrape_page(website_url)
-    debug_logs.append(hp_dbg)
-    all_emails.update(hp_data["emails"])
-    all_phones.update(hp_data["phones"])
-    all_socials.update(hp_data["socials"])
-    visited_pages.add(website_url)
-    
-    # 2. Build candidate subpages (/contact, /about, /team, and any discovered links)
     parsed = urllib.parse.urlparse(website_url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
-    direct_candidates = [
+    
+    # Target URL list in exact priority order
+    targets = [
+        website_url,
         urllib.parse.urljoin(origin, "/contact"),
+        urllib.parse.urljoin(origin, "/contact-us"),
         urllib.parse.urljoin(origin, "/about"),
-        urllib.parse.urljoin(origin, "/team")
+        urllib.parse.urljoin(origin, "/about-us")
     ]
     
-    combined_candidates = []
-    for cand in direct_candidates + hp_data.get("subpages", []):
-        if cand not in visited_pages and cand not in combined_candidates:
-            combined_candidates.append(cand)
-            
-    # Visit up to 3 subpages with polite delay
-    for page in combined_candidates[:3]:
-        if delay > 0:
-            time.sleep(delay)
-        sub_data, sub_dbg = scrape_page(page)
-        debug_logs.append(sub_dbg)
-        all_emails.update(sub_data["emails"])
-        all_phones.update(sub_data["phones"])
-        all_socials.update(sub_data["socials"])
-        visited_pages.add(page)
+    for target in targets:
+        if target in visited_pages:
+            continue
+        visited_pages.add(target)
         
+        if len(visited_pages) > 1 and delay > 0:
+            time.sleep(delay)
+            
+        data, dbg = scrape_page(target)
+        debug_logs.append(dbg)
+        all_emails.update(data["emails"])
+        all_phones.update(data["phones"])
+        
+        # If we have both an email and phone, stop crawling further pages to be fast
+        if all_emails and all_phones:
+            break
+            
     return {
-        "emails": list(all_emails),
-        "phones": list(all_phones)[:3],
-        "socials": list(all_socials)[:4],
+        "emails": clean_emails(list(all_emails)),
+        "phones": clean_phones(list(all_phones))[:3],
         "pages_visited": list(visited_pages)
     }, debug_logs
 
 
-def generate_and_verify_emails(
-    person_name: str,
+def extract_root_domain(domain_or_url: str) -> str:
+    """Extracts root domain for email guessing."""
+    try:
+        if domain_or_url.startswith("http"):
+            domain = urllib.parse.urlparse(domain_or_url).netloc
+        else:
+            domain = domain_or_url
+        domain = re.sub(r'^www\.', '', domain.split('/')[0]).strip().lower()
+        parts = domain.split('.')
+        if len(parts) >= 3 and parts[-2] in ('co', 'com', 'org', 'gov', 'net') and len(parts[-1]) == 2:
+            return ".".join(parts[-3:])
+        return domain
+    except Exception:
+        return ""
+
+
+def process_emails_and_fallbacks(
+    found_emails: List[str],
     domain_or_url: str,
-    found_on_site: List[str]
+    person_name: str = ""
 ) -> List[Dict[str, str]]:
     """
-    Step 7 Emails:
-    Guesses name@domain, first.last@domain, info@domain.
-    Checks MX records and marks each email status as:
-    - 'found on site'
-    - 'guessed'
-    - 'MX valid' (or 'No MX')
+    4. Fallback:
+    If site has emails -> mark as 'found on site | [MX status]'
+    If site has NO email -> generate info@domain, contact@domain, mark 'guessed | [MX status]'
     """
     results = []
+    seen = set()
     
-    # 1. First register emails found on site
-    seen_addresses = set()
-    for email in found_on_site:
-        clean = email.strip().lower()
-        if clean not in seen_addresses:
-            seen_addresses.add(clean)
+    # 1. Register emails found on site
+    for email in found_emails:
+        clean = email.lower().strip()
+        if clean not in seen:
+            seen.add(clean)
             domain = clean.split("@")[-1]
             mx_ok = check_mx_record(domain)
-            status = "found on site | MX valid" if mx_ok else "found on site | No MX"
-            results.append({"email": clean, "status": status})
+            mx_status = "MX valid" if mx_ok else "No MX"
+            results.append({
+                "email": clean,
+                "status": f"found on site | {mx_status}"
+            })
             
-    # 2. Extract domain for guessing
-    if not domain_or_url:
-        return results
+    # 2. Fallback if no email was found on the site
+    root_domain = extract_root_domain(domain_or_url)
+    if not results and root_domain and "." in root_domain:
+        mx_ok = check_mx_record(root_domain)
+        mx_status = "MX valid" if mx_ok else "No MX"
         
-    if domain_or_url.startswith("http"):
-        domain = urllib.parse.urlparse(domain_or_url).netloc
-    else:
-        domain = domain_or_url
-    domain = re.sub(r'^www\.', '', domain.split('/')[0]).strip().lower()
-    
-    if not domain or "." not in domain:
-        return results
-        
-    has_mx = check_mx_record(domain)
-    mx_label = "MX valid" if has_mx else "No MX"
-    
-    # 3. Guess info@domain
-    info_email = f"info@{domain}"
-    if info_email not in seen_addresses:
-        seen_addresses.add(info_email)
-        results.append({"email": info_email, "status": f"guessed | {mx_label}"})
-        
-    # 4. Guess person variations if name available
-    clean_name = re.sub(r'[^a-zA-Z\s]', '', person_name).strip().lower()
-    parts = clean_name.split()
-    if len(parts) >= 2:
-        first, last = parts[0], parts[-1]
-        guesses = [
-            f"{first}.{last}@{domain}",
-            f"{first}@{domain}",
-            f"{first[0]}{last}@{domain}"
+        fallback_candidates = [
+            f"info@{root_domain}",
+            f"contact@{root_domain}"
         ]
-        for g in guesses:
-            if g not in seen_addresses:
-                seen_addresses.add(g)
-                results.append({"email": g, "status": f"guessed | {mx_label}"})
-    elif len(parts) == 1 and parts[0]:
-        single_g = f"{parts[0]}@{domain}"
-        if single_g not in seen_addresses:
-            seen_addresses.add(single_g)
-            results.append({"email": single_g, "status": f"guessed | {mx_label}"})
-            
+        
+        # Also guess person name if available
+        if person_name:
+            c_name = re.sub(r'[^a-zA-Z\s]', '', person_name).strip().lower()
+            parts = c_name.split()
+            if len(parts) >= 2:
+                fallback_candidates.append(f"{parts[0]}.{parts[-1]}@{root_domain}")
+            elif len(parts) == 1 and parts[0]:
+                fallback_candidates.append(f"{parts[0]}@{root_domain}")
+                
+        for cand in fallback_candidates:
+            if cand not in seen:
+                seen.add(cand)
+                results.append({
+                    "email": cand,
+                    "status": f"guessed | {mx_status}"
+                })
+                
     return results

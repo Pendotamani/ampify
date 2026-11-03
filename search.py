@@ -1,17 +1,121 @@
-import time
 import re
 import urllib.parse
 from typing import List, Dict, Any, Optional, Tuple, Set
 from ddgs import DDGS
 import requests
 
-EXCLUDED_DOMAINS = {
-    "duckduckgo.com", "google.com", "bing.com", "yahoo.com", "facebook.com",
-    "instagram.com", "twitter.com", "x.com", "youtube.com", "wikipedia.org",
-    "justdial.com", "indiamart.com", "sulekha.com", "quikr.com", "linkedin.com",
-    "yellowpages.com", "yelp.com", "mapquest.com", "tripadvisor.com",
-    "glassdoor.co.in", "glassdoor.com", "naukri.com", "indeed.com"
+# Blocked domains including e-commerce, aggregators, search, and social media
+BLOCKED_DOMAINS = {
+    "microsoft.com", "youtube.com", "zhihu.com", "baidu.com", "wikipedia.org",
+    "flipkart.com", "facebook.com", "instagram.com", "pinterest.com", "quora.com",
+    "reddit.com", "medium.com", "linkedin.com", "justdial.com", "indiamart.com",
+    "sulekha.com", "quikr.com", "yellowpages.com", "yelp.com", "mapquest.com",
+    "tripadvisor.com", "glassdoor.com", "glassdoor.co.in", "naukri.com", "indeed.com",
+    "google.com", "duckduckgo.com", "bing.com", "yahoo.com"
 }
+
+# Synonyms for business categories
+KEYWORD_SYNONYMS = {
+    "transport": ["transport", "logistics", "cargo", "cabs", "travels", "fleet", "movers", "packers", "carriers", "transit"],
+    "fleet owner": ["fleet", "transport", "logistics", "trucks", "cabs", "vehicles", "commercial vehicles", "transporters"],
+    "logistics": ["logistics", "supply chain", "freight", "cargo", "warehousing", "transport", "shipping"],
+    "travel agencies": ["travels", "tours", "tourist", "cabs", "holidays", "travel agency", "packages", "trips"],
+    "restaurants": ["restaurant", "dining", "food", "cafe", "kitchen", "eatery", "bistro", "bar & restaurant"],
+    "real estate": ["real estate", "realty", "properties", "builders", "developers", "estates", "apartments", "housing"],
+    "it": ["software", "tech", "technology", "it services", "solutions", "cloud", "digital", "systems"],
+    "hotels": ["hotel", "resort", "inn", "suites", "stay", "guest house", "hospitality"],
+    "clinics": ["clinic", "hospital", "health", "care", "medical", "dentist", "doctor", "specialist"],
+    "retail": ["store", "mart", "retail", "supermarket", "fashion", "shop", "outlet"],
+    "marketing agency": ["marketing", "advertising", "seo", "branding", "digital agency", "media"]
+}
+
+ARTICLE_PATTERNS = [
+    r'\btop\s*\d+\b', r'\bbest\b', r'\bhow\s+to\b', r'\blist\s+of\b',
+    r'\b10\s+best\b', r'\b5\s+best\b', r'\b20\s+best\b', r'\bblog\b',
+    r'\bdirectory\b', r'\breviews\b', r'\bwiki\b'
+]
+
+
+def is_latin_or_english(text: str) -> bool:
+    """Checks if text contains predominantly Latin/English characters."""
+    if not text:
+        return True
+    # Strip common punctuation and numbers
+    letters_only = re.sub(r'[\s\d\W]', '', text)
+    if not letters_only:
+        return True
+    # Check ASCII / Latin letters
+    latin_count = sum(1 for c in letters_only if '\u0000' <= c <= '\u024F')
+    return (latin_count / len(letters_only)) >= 0.75
+
+
+def get_root_domain(url: str) -> str:
+    """Extracts company root domain (e.g. 'https://sub.domain.com/path' -> 'domain.com')."""
+    try:
+        netloc = urllib.parse.urlparse(url).netloc.lower()
+        netloc = re.sub(r'^www\.', '', netloc)
+        parts = netloc.split('.')
+        if len(parts) >= 2:
+            # Handle co.in, com.au, co.uk
+            if len(parts) >= 3 and parts[-2] in ('co', 'com', 'org', 'gov', 'net') and len(parts[-1]) == 2:
+                return ".".join(parts[-3:])
+            return ".".join(parts[-2:])
+        return netloc
+    except Exception:
+        return ""
+
+
+def is_blocked_domain(domain: str) -> bool:
+    """Checks if domain matches blocked list or amazon.*."""
+    clean = domain.lower()
+    if "amazon." in clean:
+        return True
+    for blocked in BLOCKED_DOMAINS:
+        if blocked in clean:
+            return True
+    return False
+
+
+def is_junk_result(title: str, snippet: str, url: str, business_type: str, city: str) -> bool:
+    """
+    1. Junk filter (before crawling):
+    - Block domains
+    - Skip non-Latin/English
+    - Skip 'top 10', 'best', 'how to', 'list of'
+    - Require business keyword (or synonym) AND city in title or snippet
+    """
+    root_domain = get_root_domain(url)
+    if not root_domain or is_blocked_domain(root_domain):
+        return True
+        
+    combined_text = f"{title} {snippet}".lower()
+    
+    # Check Latin script
+    if not is_latin_or_english(title) or not is_latin_or_english(snippet):
+        return True
+        
+    # Check for list or article patterns
+    for pat in ARTICLE_PATTERNS:
+        if re.search(pat, title, re.IGNORECASE):
+            return True
+            
+    # Check city name
+    city_lower = city.lower().strip()
+    if city_lower not in combined_text and city_lower not in url.lower():
+        return True
+        
+    # Check business keyword or synonyms
+    bt_lower = business_type.lower().strip()
+    synonyms = [bt_lower]
+    for key, syn_list in KEYWORD_SYNONYMS.items():
+        if key in bt_lower or bt_lower in key:
+            synonyms.extend(syn_list)
+            
+    matched_keyword = any(syn in combined_text for syn in synonyms)
+    if not matched_keyword:
+        return True
+        
+    return False
 
 
 def search_web_companies(
@@ -24,8 +128,7 @@ def search_web_companies(
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     Source 2 web search: Queries '[business type] in [city] [country] contact'.
-    Uses ddgs package, with retries on rate limits, and falls back to Brave Search or Serper if keys are provided.
-    Returns (results, debug_info).
+    Applies junk filter, root domain extraction, and domain deduplication.
     """
     query = f"{business_type} in {city} {country} contact"
     debug = {
@@ -38,132 +141,67 @@ def search_web_companies(
     }
     
     results = []
-    seen_domains: Set[str] = set()
+    seen_root_domains: Set[str] = set()
     
-    # 1. Primary: ddgs package with retry
-    for attempt in range(2):
-        try:
-            ddgs_client = DDGS(timeout=10)
-            raw_items = list(ddgs_client.text(query, max_results=max_results * 2))
-            debug["status"] = 200
-            debug["response_sample"] = str(raw_items[:2])[:200]
+    try:
+        ddgs_client = DDGS(timeout=10)
+        raw_items = list(ddgs_client.text(query, max_results=max_results * 4))
+        debug["status"] = 200
+        debug["response_sample"] = str(raw_items[:2])[:200]
+        
+        for item in raw_items:
+            url = item.get("href", "")
+            title = item.get("title", "")
+            snippet = item.get("body", "")
             
-            for item in raw_items:
-                clean_url = item.get("href", "")
-                if not clean_url or not clean_url.startswith("http"):
-                    continue
-                    
-                domain = urllib.parse.urlparse(clean_url).netloc.lower()
-                clean_domain = re.sub(r'^www\.', '', domain)
+            if not url or not url.startswith("http"):
+                continue
                 
-                if any(ex in clean_domain for ex in EXCLUDED_DOMAINS):
-                    continue
-                if clean_domain in seen_domains:
-                    continue
-                seen_domains.add(clean_domain)
+            # Junk filter
+            if is_junk_result(title, snippet, url, business_type, city):
+                continue
                 
-                title = item.get("title", clean_domain)
-                snippet = item.get("body", "")
-                
-                name = re.split(r'[:|\-–]|Contact|About|Home|Services', title)[0].strip()
-                if not name or len(name) < 3:
-                    name = clean_domain.split('.')[0].capitalize()
-                    
-                snippet_emails = re.findall(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', snippet)
-                
-                results.append({
-                    "name": name,
-                    "website": clean_url,
-                    "city": city,
-                    "country": country,
-                    "business_type": business_type,
-                    "address": f"{city}, {country}",
-                    "phone": "",
-                    "snippet": snippet,
-                    "initial_email": snippet_emails[0] if snippet_emails else "",
-                    "source": "Web Search (ddgs)"
-                })
-                
-                if len(results) >= max_results:
-                    break
-                    
-            if results:
-                return results, debug
-        except Exception as e:
-            debug["error"] = str(e)
-            time.sleep(1.5)
+            root_dom = get_root_domain(url)
+            if not root_dom or root_dom in seen_root_domains:
+                continue
+            seen_root_domains.add(root_dom)
             
-    # 2. Fallback to Brave Search if provided
-    if not results and brave_api_key.strip():
-        debug["fallback_triggered"] = True
-        debug["engine_used"] = "Brave Search API"
-        try:
-            brave_url = "https://api.search.brave.com/res/v1/web/search"
-            headers = {"Accept": "application/json", "X-Subscription-Token": brave_api_key.strip()}
-            b_resp = requests.get(brave_url, params={"q": query, "count": max_results}, headers=headers, timeout=8)
-            debug["status"] = b_resp.status_code
-            debug["response_sample"] = b_resp.text[:200]
-            if b_resp.status_code == 200:
-                b_items = b_resp.json().get("web", {}).get("results", [])
-                for b in b_items:
-                    url = b.get("url")
-                    dom = re.sub(r'^www\.', '', urllib.parse.urlparse(url).netloc.lower())
-                    if not any(ex in dom for ex in EXCLUDED_DOMAINS) and dom not in seen_domains:
-                        seen_domains.add(dom)
-                        results.append({
-                            "name": b.get("title", dom).split("-")[0].strip(),
-                            "website": url,
-                            "city": city,
-                            "country": country,
-                            "business_type": business_type,
-                            "address": f"{city}, {country}",
-                            "phone": "",
-                            "snippet": b.get("description", ""),
-                            "initial_email": "",
-                            "source": "Web Search (Brave API)"
-                        })
-                return results, debug
-        except Exception as e:
-            debug["error"] = f"Brave Search Error: {e}"
-
-    # 3. Fallback to Serper.dev if provided
-    if not results and serper_api_key.strip():
-        debug["fallback_triggered"] = True
-        debug["engine_used"] = "Serper.dev API"
-        try:
-            serper_url = "https://google.serper.dev/search"
-            headers = {"X-API-KEY": serper_api_key.strip(), "Content-Type": "application/json"}
-            s_resp = requests.post(serper_url, json={"q": query, "num": max_results}, headers=headers, timeout=8)
-            debug["status"] = s_resp.status_code
-            debug["response_sample"] = s_resp.text[:200]
-            if s_resp.status_code == 200:
-                s_items = s_resp.json().get("organic", [])
-                for s in s_items:
-                    url = s.get("link")
-                    dom = re.sub(r'^www\.', '', urllib.parse.urlparse(url).netloc.lower())
-                    if not any(ex in dom for ex in EXCLUDED_DOMAINS) and dom not in seen_domains:
-                        seen_domains.add(dom)
-                        results.append({
-                            "name": s.get("title", dom).split("-")[0].strip(),
-                            "website": url,
-                            "city": city,
-                            "country": country,
-                            "business_type": business_type,
-                            "address": f"{city}, {country}",
-                            "phone": "",
-                            "snippet": s.get("snippet", ""),
-                            "initial_email": "",
-                            "source": "Web Search (Serper.dev)"
-                        })
-                return results, debug
-        except Exception as e:
-            debug["error"] = f"Serper Error: {e}"
-
+            # Clean company name
+            name = re.split(r'[:|\-–]|Contact|About|Home|Services', title)[0].strip()
+            if not name or len(name) < 3:
+                name = root_dom.split('.')[0].capitalize()
+                
+            # Extract emails and phones from snippet if present
+            snippet_emails = re.findall(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', snippet)
+            snippet_phones = re.findall(r'(?:\+?\d{1,3}[-.\s]?)?\(?\d{2,5}\)?[-.\s]?\d{3,5}[-.\s]?\d{3,5}', snippet)
+            
+            clean_phones = [p.strip() for p in snippet_phones if 8 <= len(re.sub(r'\D', '', p)) <= 15]
+            
+            results.append({
+                "name": name,
+                "website": f"https://{root_dom}",
+                "city": city,
+                "country": country,
+                "business_type": business_type,
+                "address": f"{city}, {country}",
+                "phone": clean_phones[0] if clean_phones else "",
+                "snippet": snippet,
+                "initial_email": snippet_emails[0].lower() if snippet_emails else "",
+                "source": "Web Search (ddgs)"
+            })
+            
+            if len(results) >= max_results:
+                break
+                
+        if results:
+            return results, debug
+    except Exception as e:
+        debug["error"] = str(e)
+        
     return results, debug
 
 
 def parse_linkedin_snippet(title: str, snippet: str, default_role: str = "") -> Dict[str, str]:
-    """Extracts person name, role from LinkedIn SERP snippet."""
     cleaned = re.sub(r'[\s\-|–]+LinkedIn.*$', '', title, flags=re.IGNORECASE).strip()
     parts = re.split(r'\s+[-–|]\s+', cleaned)
     name = parts[0].strip() if parts else ""
@@ -181,11 +219,6 @@ def search_decision_maker_linkedin(
     company: str,
     city: str
 ) -> Tuple[Optional[Dict[str, str]], Dict[str, Any]]:
-    """
-    Step 6 Decision makers:
-    Search '[role] [company] [city] site:linkedin.com/in' via ddgs.
-    Never log into or scrape LinkedIn directly.
-    """
     query = f'{role} {company} {city} site:linkedin.com/in'
     debug = {"query": query, "status": None, "error": None, "response_sample": ""}
     
